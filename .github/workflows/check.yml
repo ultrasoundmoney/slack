@@ -1,0 +1,21 @@
+name: Check
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features: ["--no-default-features", "--no-default-features --features async", "--no-default-features --features blocking", "--all-features"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo check --locked ${{ matrix.features }} --all-targets
+      - run: cargo clippy --locked ${{ matrix.features }} --all-targets -- -D warnings
+      - run: cargo test --locked ${{ matrix.features }} --all-targets
+      - run: cargo test --locked ${{ matrix.features }} --doc
