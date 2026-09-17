@@ -26,6 +26,33 @@ which channel a service uses by default. Separate apps/tokens are needed for
 stronger isolation. An application-side channel list does not narrow the token's
 Slack permissions.
 
+## Credential names
+
+Use Slack's interface names for the app credentials in local configuration and
+1Password:
+
+| Configuration name | Slack interface field | Purpose |
+| --- | --- | --- |
+| `SLACK_BOT_TOKEN` | Bot User OAuth Token | Required for posting; passed to `SlackBot` or `BlockingSlackBot` |
+| `SLACK_APP_TOKEN` | App-Level Token | Future Socket Mode (`connections:write`); not used for posting |
+| `CLIENT_SECRET` | Client Secret | OAuth code exchange and refresh; not used by this posting crate |
+| `SIGNING_SECRET` | Signing Secret | Verify inbound HTTP signatures; not used by this posting crate |
+
+An app-level token (`xapp-…`) is another separate credential used for Socket Mode.
+Neither app secret replaces a bot or app-level token, and rotating an app secret
+does not rotate those tokens.
+
+Keep local values in the ignored `.env`; `.env.example` contains names only.
+The runnable examples read process environment variables, not `.env` files.
+Store the two app secrets as concealed `CLIENT_SECRET` and `SIGNING_SECRET`
+fields in 1Password. Existing `bot_token` and `app_token` fields retain their names;
+map `bot_token` to the process variable `SLACK_BOT_TOKEN` when running examples,
+and `app_token` to `SLACK_APP_TOKEN` for a future Socket Mode receiver.
+Only inject credentials needed by the process: posting needs no app secrets.
+
+References: [OAuth](https://docs.slack.dev/authentication/installing-with-oauth/),
+[request verification](https://docs.slack.dev/authentication/verifying-requests-from-slack/).
+
 ## Rotation
 
 For manual credential replacement, generate/reinstall credentials through Slack's

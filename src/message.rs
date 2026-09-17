@@ -1,180 +1,108 @@
 use std::fmt::Display;
 
-/// Conservative library budget, not Slack's hard limit.
-pub const MESSAGE_MAX_CHARS: usize = 4_000;
-const VALUE_MAX_CHARS: usize = 1_000;
+/// Maximum top-level `text` length accepted by this crate, before Slack truncates it.
+/// Counted after escaping literal text, excluding JSON string encoding.
+pub const MESSAGE_MAX_CHARS: usize = 40_000;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ParseMode {
-    #[default]
-    Plain,
-    Mrkdwn,
+/// Escape Slack's special parsing characters in a literal fragment.
+///
+/// This does not escape mrkdwn delimiters such as `*`, `_`, or backticks.
+/// Use `SlackMessage::plain` for arbitrary text that must not be formatted.
+pub fn escape_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub enum ValueBudget {
-    #[default]
-    Default,
-    Unlimited,
-    Chars(usize),
+/// Explicitly shorten literal source text, including a visible ellipsis in the budget.
+///
+/// Counts Unicode scalar values before Slack entity encoding. This preserves UTF-8,
+/// but may split a grapheme cluster. It is not safe for truncating formatted mrkdwn.
+/// The resulting message is still subject to send-time validation after escaping.
+pub fn truncate_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_owned();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    text.chars()
+        .take(max_chars - 1)
+        .chain(std::iter::once('…'))
+        .collect()
 }
 
-/// Text is private so every message obeys the final-message budget.
+/// A message keeps its original text; plain text is escaped only for transmission.
 #[derive(Clone)]
 pub struct SlackMessage {
     text: String,
-    mode: ParseMode,
+    mrkdwn: bool,
 }
 impl std::fmt::Debug for SlackMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SlackMessage")
-            .field("mode", &self.mode)
+            .field("mrkdwn", &self.mrkdwn)
             .finish_non_exhaustive()
     }
 }
 impl SlackMessage {
-    pub fn plain(text: impl Display) -> Self {
-        MessageBuilder::default().line(text).build()
+    /// Preserve literal text without parsing it as formatting or mention syntax.
+    pub fn plain(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            mrkdwn: false,
+        }
     }
+
+    /// Send caller-authored Slack mrkdwn unchanged.
+    ///
+    /// Explicit links and mentions remain active, even though automatic parsing is
+    /// disabled. Do not pass arbitrary user/log text here. `escape_text` neutralizes
+    /// special angle-bracket syntax, but not emphasis or code delimiters.
+    pub fn mrkdwn(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            mrkdwn: true,
+        }
+    }
+
+    /// Original source text, before any transport escaping.
     pub fn text(&self) -> &str {
         &self.text
     }
-    pub fn parse_mode(&self) -> ParseMode {
-        self.mode
+    pub fn is_mrkdwn(&self) -> bool {
+        self.mrkdwn
+    }
+
+    #[cfg(any(test, feature = "async", feature = "blocking"))]
+    pub(crate) fn wire_text(&self) -> std::borrow::Cow<'_, str> {
+        if self.mrkdwn {
+            std::borrow::Cow::Borrowed(&self.text)
+        } else {
+            std::borrow::Cow::Owned(escape_text(&self.text))
+        }
     }
 }
 
+/// Optional convenience for assembling plain-text lines; no field budgets or formatting.
 #[derive(Default)]
 pub struct MessageBuilder {
-    mode: ParseMode,
-    parts: Vec<(String, &'static str)>,
+    lines: Vec<String>,
 }
 impl MessageBuilder {
-    pub fn new(mode: ParseMode) -> Self {
-        Self {
-            mode,
-            parts: Vec::new(),
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
     pub fn line(mut self, text: impl Display) -> Self {
-        self.parts.push((text.to_string(), ""));
+        self.lines.push(text.to_string());
         self
-    }
-    pub fn bold_line(mut self, text: impl Display) -> Self {
-        self.parts.push((text.to_string(), "*"));
-        self
-    }
-    pub fn heading(self, text: impl Display) -> Self {
-        self.bold_line(text)
     }
     pub fn kv(self, key: impl Display, value: impl Display) -> Self {
-        self.kv_with_budget(key, value, ValueBudget::Default)
-    }
-    pub fn kv_with_budget(
-        self,
-        key: impl Display,
-        value: impl Display,
-        budget: ValueBudget,
-    ) -> Self {
-        self.line(format!("{key}: {}", budget_value(value, budget)))
-    }
-    pub fn kv_code(mut self, key: impl Display, value: impl Display) -> Self {
-        self.parts.push((
-            format!("{key}: {}", budget_value(value, ValueBudget::Default)),
-            "`",
-        ));
-        self
-    }
-    pub fn error(self, key: impl Display, value: impl Display) -> Self {
-        self.error_with_budget(key, value, ValueBudget::Default)
-    }
-    pub fn error_with_budget(
-        mut self,
-        key: impl Display,
-        value: impl Display,
-        budget: ValueBudget,
-    ) -> Self {
-        self.parts
-            .push((format!("{key}:\n{}", budget_value(value, budget)), "```"));
-        self
+        self.line(format!("{key}: {value}"))
     }
     pub fn build(self) -> SlackMessage {
-        let mut text = String::new();
-        let mut remaining = MESSAGE_MAX_CHARS;
-        for (index, (value, wrapper)) in self.parts.iter().enumerate() {
-            let wrapper = if self.mode == ParseMode::Mrkdwn {
-                *wrapper
-            } else {
-                ""
-            };
-            let separator = usize::from(index > 0);
-            let overhead = separator + 2 * wrapper.len();
-            // Reserve a truncation indicator if subsequent content cannot fit.
-            if remaining <= overhead + 1 {
-                break;
-            }
-            let (rendered, truncated) = render(value, self.mode, remaining - overhead - 1);
-            if index > 0 {
-                text.push('\n');
-            }
-            text.push_str(wrapper);
-            text.push_str(&rendered);
-            text.push_str(wrapper);
-            remaining -= overhead + rendered.chars().count();
-            if truncated || (index + 1 < self.parts.len() && remaining <= 9) {
-                text.push('…');
-                break;
-            }
-        }
-        SlackMessage {
-            text,
-            mode: self.mode,
-        }
+        SlackMessage::plain(self.lines.join("\n"))
     }
-}
-fn budget_value(value: impl Display, budget: ValueBudget) -> String {
-    let value = value.to_string();
-    let limit = match budget {
-        ValueBudget::Default => VALUE_MAX_CHARS,
-        ValueBudget::Unlimited => return value,
-        ValueBudget::Chars(n) => n,
-    };
-    if value.chars().count() <= limit {
-        return value;
-    }
-    if limit == 0 {
-        return String::new();
-    }
-    value
-        .chars()
-        .take(limit - 1)
-        .chain(std::iter::once('…'))
-        .collect()
-}
-fn render(value: &str, mode: ParseMode, budget: usize) -> (String, bool) {
-    let mut out = String::new();
-    let mut remaining = budget;
-    for c in value.chars() {
-        // Slack does not support general backslash escaping. Neutralize user-supplied
-        // markup delimiters with visible Unicode equivalents; only builders add markup.
-        let replacement = match (mode, c) {
-            (_, '&') => "&amp;".to_owned(),
-            (_, '<') => "&lt;".to_owned(),
-            (_, '>') => "&gt;".to_owned(),
-            (ParseMode::Mrkdwn, '*') => "∗".to_owned(),
-            (ParseMode::Mrkdwn, '_') => "＿".to_owned(),
-            (ParseMode::Mrkdwn, '~') => "∼".to_owned(),
-            (ParseMode::Mrkdwn, '`') => "ˋ".to_owned(),
-            _ => c.to_string(),
-        };
-        let count = replacement.chars().count();
-        if count > remaining {
-            return (out, true);
-        }
-        out.push_str(&replacement);
-        remaining -= count;
-    }
-    (out, false)
 }
 
 #[cfg(test)]
@@ -183,35 +111,55 @@ mod tests {
     use proptest::prelude::*;
     proptest! {
         #[test]
-        fn budget_and_balanced_markup(value in ".{0,10000}") {
-            let m = MessageBuilder::new(ParseMode::Mrkdwn).heading(&value).error("error", &value).build();
-            prop_assert!(m.text().chars().count() <= MESSAGE_MAX_CHARS);
-            prop_assert_eq!(m.text().matches('*').count() % 2, 0);
-            prop_assert_eq!(m.text().matches('`').count() % 6, 0);
-            prop_assert!(!m.text().contains('<'));
+        fn plain_text_roundtrips_without_punctuation_changes(text in ".{0,2000}") {
+            let message = SlackMessage::plain(text.clone());
+            prop_assert_eq!(message.text(), &text);
+            let wire = message.wire_text();
+            prop_assert!(!wire.contains('<') && !wire.contains('>'));
+            let decoded = wire.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&");
+            prop_assert_eq!(decoded, text);
         }
         #[test]
-        fn values_obey_budget(value in ".{0,3000}", limit in 0usize..1000) {
-            prop_assert!(budget_value(&value, ValueBudget::Chars(limit)).chars().count() <= limit);
+        fn opt_in_truncation_obeys_requested_budget(text in ".{0,2000}", limit in 0usize..2000) {
+            let output = truncate_text(&text, limit);
+            prop_assert!(output.chars().count() <= limit);
+            if text.chars().count() <= limit { prop_assert_eq!(output, text); }
+            else if limit > 0 {
+                prop_assert!(output.ends_with('…'));
+                prop_assert_eq!(output.chars().count(), limit);
+            }
         }
     }
     #[test]
-    fn escapes_mentions_and_markup() {
-        let m = MessageBuilder::new(ParseMode::Mrkdwn)
-            .line("<!channel> <@U123> & *x* ```")
-            .build();
-        assert_eq!(m.text(), "&lt;!channel&gt; &lt;@U123&gt; &amp; ∗x∗ ˋˋˋ");
-        assert_eq!(SlackMessage::plain("<@U123>").text(), "&lt;@U123&gt;");
+    fn plain_escapes_special_parsing_but_preserves_logs() {
+        let message = SlackMessage::plain("<!channel> <@U123> a_b *x* ~y~ `z` &amp;");
+        assert_eq!(
+            message.wire_text(),
+            "&lt;!channel&gt; &lt;@U123&gt; a_b *x* ~y~ `z` &amp;amp;"
+        );
+        assert!(!message.is_mrkdwn());
     }
     #[test]
-    fn truncation_preserves_later_fields_and_entities() {
-        let m = MessageBuilder::default()
-            .error("error", "é".repeat(5000))
+    fn explicit_mrkdwn_is_passed_through() {
+        let text = "*heading*\n<https://example.com|link> <@U123> `a_b`";
+        let message = SlackMessage::mrkdwn(text);
+        assert_eq!(message.wire_text(), text);
+        assert!(message.is_mrkdwn());
+    }
+    #[test]
+    fn builder_does_not_truncate_large_values() {
+        let value = "é".repeat(5000);
+        let message = MessageBuilder::new()
+            .line("alert")
+            .kv("error", &value)
             .kv("slot", 42)
             .build();
-        assert!(m.text().contains('…'));
-        assert!(m.text().ends_with("slot: 42"));
-        let m = SlackMessage::plain("&".repeat(5000));
-        assert!(m.text().ends_with("&amp;…"));
+        assert_eq!(message.text(), format!("alert\nerror: {value}\nslot: 42"));
+    }
+    #[test]
+    fn truncation_handles_zero_and_unicode() {
+        assert_eq!(truncate_text("abc", 0), "");
+        assert_eq!(truncate_text("abc", 1), "…");
+        assert_eq!(truncate_text("é🙂界x", 3), "é🙂…");
     }
 }

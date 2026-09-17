@@ -1,10 +1,10 @@
 # slack
 
-Small Rust Slack bot client and safe operational message builders. Posts through
+Small Rust Slack bot client with literal text by default and explicit formatting. Posts through
 `chat.postMessage` using a bot token; no listener or public endpoint is needed.
 
 ```toml
-slack = { git = "https://github.com/ultrasoundmoney/slack", tag = "v0.1.0" }
+slack = { git = "https://github.com/ultrasoundmoney/slack", tag = "v0.2.0" }
 ```
 
 Rust 2024. Default feature: `async` (`reqwest`). Optional: `blocking` (`ureq`).
@@ -17,13 +17,13 @@ the package version.
 ```rust,no_run
 # #[cfg(feature = "async")]
 # async fn example() -> Result<(), slack::Error> {
-use slack::{MessageBuilder, ParseMode, SlackBot, SlackMessage, SendOptions};
+use slack::{MessageBuilder, SlackBot, SlackMessage, SendOptions};
 let bot = SlackBot::new("BOT_TOKEN", "C_DEFAULT_CHANNEL");
-let message = MessageBuilder::new(ParseMode::Mrkdwn)
-    .heading("relay alert")
+let message = MessageBuilder::new()
+    .line("relay alert")
     .kv("service", "auction-api")
-    .kv_code("slot", 12345)
-    .error("error", "simulation failed: unexpected `root`")
+    .kv("slot", 12345)
+    .kv("error", "simulation failed: unexpected `root`")
     .build();
 let sent = bot.send(&message).await?;
 bot.send_to("C_OTHER_CHANNEL", &SlackMessage::plain("status update")).await?;
@@ -40,7 +40,7 @@ bot.send_with_options(&SlackMessage::plain("follow-up"), SendOptions {
 Enable `blocking`, optionally disabling the default `async` feature:
 
 ```toml
-slack = { git = "https://github.com/ultrasoundmoney/slack", tag = "v0.1.0", default-features = false, features = ["blocking"] }
+slack = { git = "https://github.com/ultrasoundmoney/slack", tag = "v0.2.0", default-features = false, features = ["blocking"] }
 ```
 
 ```rust,no_run
@@ -60,33 +60,70 @@ proxies: the supplied endpoint receives your token. Injected async clients must
 disable redirects and retries; default clients do so. Blocking requests disable
 redirects per request.
 
-## Message safety and budgets
+## Literal text and explicit formatting
 
-`MessageBuilder::default()` and `SlackMessage::plain` use plain text. `Mrkdwn`
-adds only the formatting requested through builder methods. User values are
-never interpreted as raw Slack markup:
+`SlackMessage::plain(text)` is the primary API. It retains the original source
+text, including punctuation, backticks, underscores, and long values. At send
+time, only `&`, `<`, and `>` are entity-encoded for Slack, and `mrkdwn` is disabled.
+For example, literal `<@U123>` is displayed as text rather than a user mention.
+`text()` returns the original source, not the transport-escaped representation.
 
-- `&`, `<`, and `>` become Slack entities, including in plain messages, so input
-  such as `<@U123>` cannot create an explicit mention.
-- In formatted messages, user-supplied `*`, `_`, `~`, and backticks become visible
-  Unicode equivalents (`∗`, `＿`, `∼`, `ˋ`). Slack has no general backslash escape;
-  this deliberate substitution prevents values from closing formatting spans.
-- `heading`/`bold_line`, `line`, `kv`, `kv_code`, and `error` support common alerts.
-  `kv_code` renders the entire key/value line as inline code. `error` uses a code
-  block. Plain mode omits all formatting wrappers.
-- A final serialized-text budget of 4,000 Unicode scalar values includes entities,
-  separators, wrappers, and a visible `…` when content is truncated. Entity tokens
-  and formatting wrappers are never cut apart. The renderer reserves indicator
-  space, so some messages finish slightly below 4,000.
-- Values default to 1,000 characters before escaping, preserving room for later
-  fields. `kv_with_budget` and `error_with_budget` accept `ValueBudget::Chars(n)`
-  or `Unlimited`. Unlimited bypasses only the value budget, never the final budget.
-  A zero value budget intentionally omits the value.
+`MessageBuilder::new().line(...).kv(...).build()` is an optional convenience for
+joining plain-text lines. It has no formatting modes or per-value size budgets.
 
-These are conservative library limits, not Slack's hard maximum. Code-point
-truncation preserves valid UTF-8 but may split a grapheme cluster. Empty messages
-are rejected on send. Messages disable automatic mention parsing, URL parsing,
-and link/media unfurling. There is no raw-markup escape hatch in v1.
+For caller-authored Slack formatting, use `SlackMessage::mrkdwn`:
+
+```rust
+use slack::SlackMessage;
+let message = SlackMessage::mrkdwn("*service recovered*\n<https://example.com|Dashboard>");
+assert!(message.is_mrkdwn());
+```
+
+Formatted messages are sent unchanged. Explicit links and mentions are active.
+Do not pass arbitrary logs/user text as mrkdwn. `escape_text` can neutralize `&`,
+`<`, and `>` in a literal fragment, but does not escape emphasis or code delimiters.
+Use plain text when exact arbitrary content matters. No Unicode lookalikes are
+substituted and no formatting-repair fallback is attempted.
+
+Both modes disable automatic mention parsing, automatic URL linking, and link/media
+previews. These flags do not neutralize explicit mention/link syntax in mrkdwn.
+
+## Length and explicit truncation
+
+Slack recommends 4,000 characters for readability, but truncates top-level messages
+above 40,000. This crate does not impose the recommendation as a limit.
+
+Both transports reject messages whose final `text` field exceeds 40,000 Unicode
+scalar values with `Error::MessageTooLong { chars, limit }`, before making a request.
+For plain text this check includes entity expansion (`&` becomes five characters
+in `&amp;`), but excludes JSON escapes such as `\n`. This is a conservative check
+on the submitted text, not a promise about Slack's internal display-length counting.
+There is no automatic truncation or splitting. Empty messages are also rejected.
+Block Kit has separate size rules and is not implemented by this crate.
+
+To intentionally shorten literal content, call `truncate_text` explicitly:
+
+```rust
+use slack::{SlackMessage, truncate_text};
+let message = SlackMessage::plain(truncate_text("a long diagnostic", 10));
+assert_eq!(message.text(), "a long di…");
+```
+
+The helper counts source Unicode scalar values, includes `…` within the requested
+budget, and returns an empty string for a zero budget. It preserves UTF-8 but may
+split a grapheme cluster. Escape expansion may still cause send-time rejection.
+Do not use it to truncate formatted mrkdwn: it does not repair formatting or entities.
+
+## Migrating from 0.1.0
+
+- Replace `MessageBuilder::new(ParseMode::Plain)` with `MessageBuilder::new()`.
+- Replace formatted builders with explicit `SlackMessage::mrkdwn` for authored
+  formatting, or plain messages for arbitrary data.
+- Replace `heading`/`bold_line` with `line`, and `kv_code`/`error` with `kv` when
+  plain output is appropriate. `ParseMode`, `ValueBudget`, and budget methods are removed.
+- Apply `truncate_text` only where the caller intentionally wants to shorten data.
+- Handle `Error::MessageTooLong` instead of relying on automatic truncation.
+- `text()` now exposes original source text; transport escaping occurs once on send.
 
 ## Delivery and errors
 
@@ -114,6 +151,10 @@ request/response bodies, `text()`, or returned channel IDs.
 ## Slack setup
 
 See [setup](docs/setup.md) and the [example app manifest](docs/slack-app-manifest.json).
+`CLIENT_SECRET` and `SIGNING_SECRET` match Slack’s app credential labels; they
+are separate from the `SLACK_BOT_TOKEN` required for posting. See the setup guide
+for credential mapping.
+
 Use a separate **Ultra Sound Ops** app with only `chat:write`, invited to intended
 channels. Installation, token provisioning, production changes, and service
 migration are outside this crate's release.
@@ -139,7 +180,7 @@ four feature combinations. Tests use local mocked endpoints; no Slack token is
 needed. README examples are included as crate doctests.
 
 The runnable examples **send real messages** when explicitly run with
-`SLACK_BOT_TOKEN` and `SLACK_CHANNEL_ID`. The async example sends a formatted
+`SLACK_BOT_TOKEN` and `SLACK_CHANNEL_ID`. The async example sends a plain
 message and one thread reply; the blocking example sends one plain message.
 Use an authorized test channel only. They are compiled, never executed, in CI.
 

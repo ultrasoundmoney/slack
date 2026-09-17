@@ -1,8 +1,10 @@
 #[cfg(any(feature = "async", feature = "blocking"))]
-use crate::{ParseMode, SlackMessage};
+use crate::{MESSAGE_MAX_CHARS, SlackMessage};
 use serde::Deserialize;
 #[cfg(any(feature = "async", feature = "blocking"))]
 use serde::Serialize;
+#[cfg(any(feature = "async", feature = "blocking"))]
+use std::borrow::Cow;
 use std::{fmt, time::Duration};
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(6);
@@ -28,6 +30,7 @@ impl fmt::Debug for SentMessage {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
     Validation(&'static str),
+    MessageTooLong { chars: usize, limit: usize },
     Transport,
     Http { status: u16 },
     SlackApi { code: String },
@@ -38,6 +41,10 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Validation(reason) => write!(f, "invalid slack request: {reason}"),
+            Self::MessageTooLong { chars, limit } => write!(
+                f,
+                "slack message text is {chars} characters after escaping; limit is {limit}"
+            ),
             Self::Transport => f.write_str("slack transport failed; delivery may be uncertain"),
             Self::Http { status } => write!(f, "slack http status {status}"),
             Self::SlackApi { code } => write!(f, "slack api error: {code}"),
@@ -56,7 +63,7 @@ impl std::error::Error for Error {}
 #[derive(Serialize)]
 pub(crate) struct Request<'a> {
     channel: &'a str,
-    text: &'a str,
+    text: Cow<'a, str>,
     mrkdwn: bool,
     parse: &'static str,
     link_names: bool,
@@ -89,10 +96,18 @@ impl<'a> Request<'a> {
         {
             return Err(Error::Validation("empty thread timestamp"));
         }
+        let text = message.wire_text();
+        let chars = text.chars().count();
+        if chars > MESSAGE_MAX_CHARS {
+            return Err(Error::MessageTooLong {
+                chars,
+                limit: MESSAGE_MAX_CHARS,
+            });
+        }
         Ok(Self {
             channel,
-            text: message.text(),
-            mrkdwn: message.parse_mode() == ParseMode::Mrkdwn,
+            text,
+            mrkdwn: message.is_mrkdwn(),
             parse: "none",
             link_names: false,
             unfurl_links: false,
@@ -173,6 +188,7 @@ pub(crate) fn report(result: &Result<SentMessage, Error>) {
         Err(error) => {
             let kind = match error {
                 Error::Validation(_) => "validation",
+                Error::MessageTooLong { .. } => "message_too_long",
                 Error::Transport => "transport",
                 Error::Http { .. } => "http",
                 Error::SlackApi { .. } => "api",

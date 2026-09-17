@@ -15,13 +15,30 @@ async fn send(
     options: SendOptions,
     timeout: Duration,
 ) -> Result<SentMessage, Error> {
+    send_message(
+        base,
+        blocking,
+        options,
+        timeout,
+        SlackMessage::plain(CONTENT),
+    )
+    .await
+}
+
+async fn send_message(
+    base: String,
+    blocking: bool,
+    options: SendOptions,
+    timeout: Duration,
+    message: SlackMessage,
+) -> Result<SentMessage, Error> {
     if blocking {
         #[cfg(feature = "blocking")]
         return tokio::task::spawn_blocking(move || {
             slack::blocking::BlockingSlackBot::new(TOKEN, "CDEFAULT")
                 .with_base_url(base)
                 .with_timeout(timeout)
-                .send_with_options(&SlackMessage::plain(CONTENT), options)
+                .send_with_options(&message, options)
         })
         .await
         .unwrap();
@@ -30,7 +47,7 @@ async fn send(
     return slack::SlackBot::new(TOKEN, "CDEFAULT")
         .with_base_url(base)
         .with_timeout(timeout)
-        .send_with_options(&SlackMessage::plain(CONTENT), options)
+        .send_with_options(&message, options)
         .await;
     #[cfg(not(feature = "async"))]
     unreachable!()
@@ -237,6 +254,111 @@ async fn retry_after_is_optional_and_must_be_seconds() {
                 .await,
                 Err(Error::RateLimited { retry_after: None })
             );
+        }
+    }
+}
+
+#[tokio::test]
+async fn literal_and_formatted_payloads_have_distinct_semantics() {
+    for blocking in transports() {
+        for (message, wire, mrkdwn) in [
+            (
+                SlackMessage::plain("a_b *x* `z` <@U123> &"),
+                "a_b *x* `z` &lt;@U123&gt; &amp;",
+                false,
+            ),
+            (
+                SlackMessage::mrkdwn("*heading* <https://example.com|link>"),
+                "*heading* <https://example.com|link>",
+                true,
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(body_json(serde_json::json!({
+                "channel":"CDEFAULT", "text":wire, "mrkdwn":mrkdwn,
+                "parse":"none", "link_names":false, "unfurl_links":false, "unfurl_media":false
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok":true,"channel":"CDEFAULT","ts":"123.000001"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+            send_message(
+                server.uri(),
+                blocking,
+                SendOptions::default(),
+                Duration::from_secs(2),
+                message,
+            )
+            .await
+            .unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn permits_long_messages_and_exact_encoded_limit_without_truncation() {
+    for blocking in transports() {
+        for (message, expected_text) in [
+            (SlackMessage::plain("é".repeat(5000)), "é".repeat(5000)),
+            (
+                SlackMessage::plain("🙂".repeat(40_000)),
+                "🙂".repeat(40_000),
+            ),
+            (SlackMessage::plain("&".repeat(8000)), "&amp;".repeat(8000)),
+            (SlackMessage::mrkdwn("_".repeat(40_000)), "_".repeat(40_000)),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok":true,"channel":"CDEFAULT","ts":"123.000001"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            send_message(
+                server.uri(),
+                blocking,
+                SendOptions::default(),
+                Duration::from_secs(2),
+                message,
+            )
+            .await
+            .unwrap();
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(
+                requests[0].body_json::<serde_json::Value>().unwrap()["text"],
+                expected_text
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn refuses_oversized_messages_before_network_for_both_transports() {
+    for blocking in transports() {
+        for (message, chars) in [
+            (SlackMessage::plain("é".repeat(40_001)), 40_001),
+            (SlackMessage::plain("&".repeat(8001)), 40_005),
+            (SlackMessage::mrkdwn("x".repeat(40_001)), 40_001),
+        ] {
+            let server = MockServer::start().await;
+            assert_eq!(
+                send_message(
+                    server.uri(),
+                    blocking,
+                    SendOptions::default(),
+                    Duration::from_secs(2),
+                    message
+                )
+                .await,
+                Err(Error::MessageTooLong {
+                    chars,
+                    limit: 40_000
+                })
+            );
+            assert!(server.received_requests().await.unwrap().is_empty());
         }
     }
 }
