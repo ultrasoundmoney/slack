@@ -4,7 +4,7 @@ Small Rust Slack bot client with literal text by default and explicit formatting
 `chat.postMessage` using a bot token; no listener or public endpoint is needed.
 
 ```toml
-slack = { git = "https://github.com/ultrasoundmoney/slack", tag = "v0.2.0" }
+slack = { git = "https://github.com/ultrasoundmoney/slack", tag = "v0.3.0" }
 ```
 
 Rust 2024. Default feature: `async` (`reqwest`). Optional: `blocking` (`ureq`).
@@ -40,7 +40,7 @@ bot.send_with_options(&SlackMessage::plain("follow-up"), SendOptions {
 Enable `blocking`, optionally disabling the default `async` feature:
 
 ```toml
-slack = { git = "https://github.com/ultrasoundmoney/slack", tag = "v0.2.0", default-features = false, features = ["blocking"] }
+slack = { git = "https://github.com/ultrasoundmoney/slack", tag = "v0.3.0", default-features = false, features = ["blocking"] }
 ```
 
 ```rust,no_run
@@ -62,14 +62,16 @@ redirects per request.
 
 ## Literal text and explicit formatting
 
-`SlackMessage::plain(text)` is the primary API. It retains the original source
-text, including punctuation, backticks, underscores, and long values. At send
-time, only `&`, `<`, and `>` are entity-encoded for Slack, and `mrkdwn` is disabled.
-For example, literal `<@U123>` is displayed as text rather than a user mention.
-`text()` returns the original source, not the transport-escaped representation.
+`SlackMessage::plain(text)` is the primary API. It preserves literal punctuation,
+backticks, and underscores, and automatically truncates text above 40,000 escaped
+characters. At send time, only `&`, `<`, and `>` are entity-encoded for Slack, and
+`mrkdwn` is disabled. Literal `<@U123>` is displayed as text rather than a user
+mention. `text()` returns the possibly truncated source, not the escaped payload.
 
-`MessageBuilder::new().line(...).kv(...).build()` is an optional convenience for
-joining plain-text lines. It has no formatting modes or per-value size budgets.
+`MessageBuilder::new().line(...).kv(...).build()` assembles plain-text fields.
+Each line, key/value value, and label has a default 4,000-character escaped budget.
+Use `.value_limit(n)` to override it for the whole builder, regardless of call
+order. Values are clamped to `1..=40_000`. The aggregate budget remains 40,000.
 
 For caller-authored Slack formatting, use `SlackMessage::mrkdwn`:
 
@@ -88,20 +90,51 @@ substituted and no formatting-repair fallback is attempted.
 Both modes disable automatic mention parsing, automatic URL linking, and link/media
 previews. These flags do not neutralize explicit mention/link syntax in mrkdwn.
 
-## Length and explicit truncation
+## Automatic size protection
 
-Slack recommends 4,000 characters for readability, but truncates top-level messages
-above 40,000. This crate does not impose the recommendation as a limit.
+Slack recommends 4,000 characters for readability and truncates top-level text
+above 40,000. This crate uses 40,000 as a safety ceiling; callers remain
+responsible for readable messages. There is no automatic splitting.
 
-Both transports reject messages whose final `text` field exceeds 40,000 Unicode
-scalar values with `Error::MessageTooLong { chars, limit }`, before making a request.
-For plain text this check includes entity expansion (`&` becomes five characters
-in `&amp;`), but excludes JSON escapes such as `\n`. This is a conservative check
-on the submitted text, not a promise about Slack's internal display-length counting.
-There is no automatic truncation or splitting. Empty messages are also rejected.
-Block Kit has separate size rules and is not implemented by this crate.
+Plain messages are shortened at construction. The builder first caps individual
+fields, then reduces the largest values to a common cap until the whole message
+fits. Smaller values, labels, and field order are preserved where possible.
+Labels, separators, newlines, and truncation markers all count. If even labels
+and minimal values cannot fit, trailing fields are omitted with a visible
+`[N fields omitted]` suffix. Trailing context is therefore not unconditionally
+guaranteed, particularly with an extreme number of fields or huge labels.
 
-To intentionally shorten literal content, call `truncate_text` explicitly:
+Truncation retains a source prefix and appends `… [truncated]`, included within
+the budget; tiny field budgets use `…`. Counts use Unicode scalar values after
+Slack escaping (`&` costs five characters), excluding JSON string encoding.
+Prefixes end on complete source characters, never partial entities. This is a
+conservative submitted-text budget, not a claim about Slack's internal counting.
+UTF-8 is preserved, but a grapheme cluster can be split.
+
+```rust
+use slack::MessageBuilder;
+let error = "unexpected object: ".repeat(100_000);
+let message = MessageBuilder::new()
+    .line("Settlement failed")
+    .kv("report_id", 42)
+    .kv("error", error)
+    .line("Check the stored payment status before retrying.")
+    .build();
+assert!(message.text().contains("… [truncated]"));
+assert!(message.text().ends_with("Check the stored payment status before retrying."));
+```
+
+Pass original values directly; callers do not need escape-width calculations or
+Slack-specific error helpers. Use `.value_limit(10_000)` when longer individual
+values are intentional. Use `SlackMessage::plain` for already composed text;
+its truncation preserves a prefix and cannot distinguish fields or instructions.
+
+Both transports retain final validation and reject `mrkdwn` above 40,000 with
+`Error::MessageTooLong { chars, limit }`. Raw formatted text is never automatically
+cut or repaired. Empty messages are rejected. Block Kit is not implemented.
+
+`truncate_text` remains an optional helper counting *unescaped source* scalar
+values, with `…` included in its budget and an empty result for zero:
 
 ```rust
 use slack::{SlackMessage, truncate_text};
@@ -109,10 +142,20 @@ let message = SlackMessage::plain(truncate_text("a long diagnostic", 10));
 assert_eq!(message.text(), "a long di…");
 ```
 
-The helper counts source Unicode scalar values, includes `…` within the requested
-budget, and returns an empty string for a zero budget. It preserves UTF-8 but may
-split a grapheme cluster. Escape expansion may still cause send-time rejection.
-Do not use it to truncate formatted mrkdwn: it does not repair formatting or entities.
+It is not safe for truncating formatted mrkdwn. Automatic plain-message protection
+also accounts for escape expansion, which this source-text helper does not.
+
+## Migrating from 0.2.0
+
+- Plain construction now truncates automatically; `text()` exposes that result.
+- Builder lines and values default to 4,000 escaped characters. Use `value_limit`
+  to raise or lower the field cap; aggregate protection always applies.
+- Remove caller-side Slack escaping and error-budget helpers; pass original data.
+- Raw `mrkdwn` retains its existing rejection behavior.
+- Slack's `message_truncated` warning is logged without changing successful sends
+  into errors. The warning contains no remote response text or message content.
+- Review long alerts when upgrading consumers such as Phoenix; pinned v0.2.0
+  dependencies do not change automatically.
 
 ## Migrating from 0.1.0
 
@@ -121,9 +164,8 @@ Do not use it to truncate formatted mrkdwn: it does not repair formatting or ent
   formatting, or plain messages for arbitrary data.
 - Replace `heading`/`bold_line` with `line`, and `kv_code`/`error` with `kv` when
   plain output is appropriate. `ParseMode`, `ValueBudget`, and budget methods are removed.
-- Apply `truncate_text` only where the caller intentionally wants to shorten data.
-- Handle `Error::MessageTooLong` instead of relying on automatic truncation.
-- `text()` now exposes original source text; transport escaping occurs once on send.
+- Use plain builders for automatic size protection, or explicit `mrkdwn` for authored formatting.
+- `text()` exposes possibly truncated source text; transport escaping occurs once on send.
 
 ## Delivery and errors
 
@@ -143,7 +185,8 @@ leave delivery uncertain. Retrying can duplicate a message. A 429 response
 should be rescheduled by the caller according to `Retry-After`; the crate never
 sleeps. There is no cross-client or distributed rate limiter.
 
-The crate's `tracing` events contain only success/failure and error category.
+The crate's `tracing` events contain success/failure, error category, and a fixed
+warning when Slack reports truncation; they never include remote warning text.
 Client/message/result `Debug` output omits credentials and content. Callers should
 also avoid enabling verbose HTTP-library diagnostics or logging their config,
 request/response bodies, `text()`, or returned channel IDs.

@@ -140,6 +140,8 @@ pub(crate) fn decode(
         error: Option<String>,
         channel: Option<String>,
         ts: Option<String>,
+        // Optional Slack metadata must not turn an accepted send into a failure.
+        response_metadata: Option<serde_json::Value>,
     }
     let response: Response = serde_json::from_slice(body).map_err(|_| Error::MalformedResponse)?;
     if !response.ok {
@@ -172,6 +174,19 @@ pub(crate) fn decode(
                 "unknown_error".to_owned()
             },
         });
+    }
+    if response
+        .response_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("warnings"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|warnings| {
+            warnings
+                .iter()
+                .any(|warning| warning.as_str() == Some("message_truncated"))
+        })
+    {
+        tracing::warn!("slack reported message truncation");
     }
     match (response.channel, response.ts) {
         (Some(channel), Some(ts)) if !channel.is_empty() && !ts.is_empty() => {
@@ -213,6 +228,38 @@ mod tests {
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+    #[test]
+    fn truncation_warning_is_logged_once_without_remote_text() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = Capture(bytes.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let result = decode(200, None, br#"{"ok":true,"channel":"CSECRET","ts":"1.2","response_metadata":{"warnings":["message_truncated","message_truncated","secret-token"],"messages":["private-message"]}}"#, "secret-token");
+            assert!(result.is_ok());
+            for metadata in [
+                serde_json::json!({"warnings": ["unknown-warning", 1]}),
+                serde_json::json!({"warnings": "message_truncated"}),
+                serde_json::json!(true),
+            ] {
+                let body = serde_json::to_vec(&serde_json::json!({"ok":true,"channel":"CSECRET","ts":"1.2","response_metadata":metadata})).unwrap();
+                assert!(decode(200, None, &body, "secret-token").is_ok());
+            }
+        });
+        let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert_eq!(logs.matches("slack reported message truncation").count(), 1);
+        for secret in [
+            "secret-token",
+            "private-message",
+            "CSECRET",
+            "unknown-warning",
+        ] {
+            assert!(!logs.contains(secret));
         }
     }
     #[test]
