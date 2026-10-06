@@ -336,13 +336,9 @@ async fn permits_long_messages_and_exact_encoded_limit_without_truncation() {
 }
 
 #[tokio::test]
-async fn refuses_oversized_messages_before_network_for_both_transports() {
+async fn refuses_oversized_mrkdwn_before_network_for_both_transports() {
     for blocking in transports() {
-        for (message, chars) in [
-            (SlackMessage::plain("é".repeat(40_001)), 40_001),
-            (SlackMessage::plain("&".repeat(8001)), 40_005),
-            (SlackMessage::mrkdwn("x".repeat(40_001)), 40_001),
-        ] {
+        for (message, chars) in [(SlackMessage::mrkdwn("x".repeat(40_001)), 40_001)] {
             let server = MockServer::start().await;
             assert_eq!(
                 send_message(
@@ -359,6 +355,45 @@ async fn refuses_oversized_messages_before_network_for_both_transports() {
                 })
             );
             assert!(server.received_requests().await.unwrap().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn bounded_plain_messages_and_truncation_warnings_remain_successful() {
+    for blocking in transports() {
+        for metadata in [
+            serde_json::json!({"warnings": ["message_truncated", "message_truncated", "private remote warning"]}),
+            serde_json::json!({"warnings": 123}),
+            serde_json::json!("unexpected metadata"),
+            serde_json::Value::Null,
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true, "channel": "CDEFAULT", "ts": "1.2", "response_metadata": metadata
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let message = SlackMessage::plain("<&🙂".repeat(100_000));
+            let expected = slack::escape_text(message.text());
+            let sent = send_message(
+                server.uri(),
+                blocking,
+                SendOptions::default(),
+                Duration::from_secs(2),
+                message,
+            )
+            .await
+            .unwrap();
+            assert_eq!(sent.ts, "1.2");
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 1);
+            let payload = requests[0].body_json::<serde_json::Value>().unwrap();
+            assert_eq!(payload["text"], expected);
+            assert!(expected.chars().count() <= slack::MESSAGE_MAX_CHARS);
+            assert!(expected.ends_with("… [truncated]"));
         }
     }
 }
