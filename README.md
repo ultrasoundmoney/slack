@@ -69,9 +69,8 @@ characters. At send time, only `&`, `<`, and `>` are entity-encoded for Slack, a
 mention. `text()` returns the possibly truncated source, not the escaped payload.
 
 `MessageBuilder::new().line(...).kv(...).build()` assembles plain-text fields.
-Each line, key/value value, and label has a default 4,000-character escaped budget.
-Use `.value_limit(n)` to override it for the whole builder, regardless of call
-order. Values are clamped to `1..=40_000`. The aggregate budget remains 40,000.
+Each line, key/value value, and label has a fixed 4,000-character escaped budget.
+These limits are fixed. The joined message is then capped at 40,000.
 
 For caller-authored Slack formatting, use `SlackMessage::mrkdwn`:
 
@@ -96,17 +95,15 @@ Slack recommends 4,000 characters for readability and truncates top-level text
 above 40,000. This crate uses 40,000 as a safety ceiling; callers remain
 responsible for readable messages. There is no automatic splitting.
 
-Plain messages are shortened at construction. The builder first caps individual
-fields, then reduces the largest values to a common cap until the whole message
-fits. Smaller values, labels, and field order are preserved where possible.
-Labels, separators, newlines, and truncation markers all count. If even labels
-and minimal values cannot fit, trailing fields are omitted with a visible
-`[N fields omitted]` suffix. Trailing context is therefore not unconditionally
-guaranteed, particularly with an extreme number of fields or huge labels.
+Plain messages are shortened at construction. The builder caps each line, value,
+and label at 4,000, joins the fields, then truncates the combined message to a
+40,000-character prefix. Labels, separators, newlines, and markers count toward
+the aggregate limit. A single huge error usually leaves room for later context,
+but many large fields can cause trailing instructions to be cut. Put critical
+context early when composing potentially large messages.
 
 Truncation retains a source prefix and appends `… [truncated]`, included within
-the budget; tiny field budgets use `…`. Counts use Unicode scalar values after
-Slack escaping (`&` costs five characters), excluding JSON string encoding.
+the budget. Counts use Unicode scalar values after Slack escaping (`&` costs five characters), excluding JSON string encoding.
 Prefixes end on complete source characters, never partial entities. This is a
 conservative submitted-text budget, not a claim about Slack's internal counting.
 UTF-8 is preserved, but a grapheme cluster can be split.
@@ -125,9 +122,9 @@ assert!(message.text().ends_with("Check the stored payment status before retryin
 ```
 
 Pass original values directly; callers do not need escape-width calculations or
-Slack-specific error helpers. Use `.value_limit(10_000)` when longer individual
-values are intentional. Use `SlackMessage::plain` for already composed text;
-its truncation preserves a prefix and cannot distinguish fields or instructions.
+Slack-specific error helpers. Use `SlackMessage::plain` for already composed text
+or intentional fields longer than 4,000 characters; its truncation preserves a
+prefix and cannot distinguish fields or instructions.
 
 Both transports retain final validation and reject `mrkdwn` above 40,000 with
 `Error::MessageTooLong { chars, limit }`. Raw formatted text is never automatically
@@ -148,8 +145,8 @@ also accounts for escape expansion, which this source-text helper does not.
 ## Migrating from 0.2.0
 
 - Plain construction now truncates automatically; `text()` exposes that result.
-- Builder lines and values default to 4,000 escaped characters. Use `value_limit`
-  to raise or lower the field cap; aggregate protection always applies.
+- Builder lines, values, and labels have a fixed 4,000-character escaped cap.
+  Use `SlackMessage::plain` for longer content; the aggregate cap still applies.
 - Remove caller-side Slack escaping and error-budget helpers; pass original data.
 - Raw `mrkdwn` retains its existing rejection behavior.
 - Slack's `message_truncated` warning is logged without changing successful sends
