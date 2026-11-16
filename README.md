@@ -1,230 +1,172 @@
 # slack
 
-Small Rust Slack bot client with literal text by default and explicit formatting. Posts through
-`chat.postMessage` using a bot token; no listener or public endpoint is needed.
+The Slack client our services share for alerts and notifications. It posts as the **Ultra Sound
+Ops** bot through the Web API, with:
+
+- **A message builder** that turns titles, fields, errors and links into a well formatted rich
+  text message. Values are always literal, so a log line full of `*`, `_` or `<@U123>` shows up
+  exactly as written.
+- **Optional retries**, so a network blip doesn't eat an alert and every service doesn't need its
+  own retry loop.
+- **Errors that say what went wrong**: the HTTP library's error chain, the status code, Slack's
+  error code and the start of the response body.
+- **Async and blocking clients** with the same API. The blocking one is for code outside an async
+  runtime, like a dedicated writer thread.
 
 ```toml
-slack = { git = "https://github.com/ultrasoundmoney/slack", tag = "v0.3.0" }
+slack = { git = "https://github.com/ultrasoundmoney/slack", tag = "v0.4.0" }
+
+# blocking only
+slack = { git = "https://github.com/ultrasoundmoney/slack", tag = "v0.4.0", default-features = false, features = ["blocking"] }
 ```
 
-Rust 2024. Default feature: `async` (`reqwest`). Optional: `blocking` (`ureq`).
-Disable default features for message construction without an HTTP transport.
-The crate is distributed by Git tags, not crates.io. `slack::VERSION` exposes
-the package version.
+| Feature | Gives you | Built on |
+| --- | --- | --- |
+| `async` (default) | `slack::SlackBot` | reqwest |
+| `blocking` | `slack::blocking::SlackBot` | ureq |
+| neither | messages only | |
 
-## Async sending
+## Sending an alert
 
 ```rust,no_run
 # #[cfg(feature = "async")]
 # async fn example() -> Result<(), slack::Error> {
-use slack::{MessageBuilder, SlackBot, SlackMessage, SendOptions};
-let bot = SlackBot::new("BOT_TOKEN", "C_DEFAULT_CHANNEL");
-let message = MessageBuilder::new()
-    .line("relay alert")
-    .kv("service", "auction-api")
-    .kv("slot", 12345)
-    .kv("error", "simulation failed: unexpected `root`")
+use slack::{Message, MessageBuilder, Retry, SlackBot};
+
+let bot = SlackBot::new("xoxb-...", "C0123456789")?
+    .with_retry(Retry::at_least_once(Retry::ALERT_DELAYS));
+
+let alert = MessageBuilder::new("bundle tracer persistence failed")
+    .context("rbx-prod-mainnet")
+    .kv("aggregation slot", 15646338)
+    .code("error", "pool timed out while waiting for an open connection")
+    .link("dashboard", "https://grafana.example.com/d/builder")
+    .footer("relay submissions disabled until process restart")
     .build();
-let sent = bot.send(&message).await?;
-bot.send_to("C_OTHER_CHANNEL", &SlackMessage::plain("status update")).await?;
-bot.send_with_options(&SlackMessage::plain("follow-up"), SendOptions {
-    channel: Some(sent.channel),
-    thread_ts: Some(sent.ts),
-}).await?;
+
+let sent = bot.send(&alert).await?;
+bot.reply(&sent, &Message::plain("restarted, submissions resumed")).await?;
 # Ok(())
 # }
 ```
 
-## Blocking sending
-
-Enable `blocking`, optionally disabling the default `async` feature:
-
-```toml
-slack = { git = "https://github.com/ultrasoundmoney/slack", tag = "v0.3.0", default-features = false, features = ["blocking"] }
-```
+The blocking client is the same without `.await`:
 
 ```rust,no_run
 # #[cfg(feature = "blocking")]
 # fn example() -> Result<(), slack::Error> {
-use slack::{SlackMessage, blocking::BlockingSlackBot};
-let bot = BlockingSlackBot::new("BOT_TOKEN", "C_DEFAULT_CHANNEL");
-bot.send(&SlackMessage::plain("service started"))?;
+use slack::{Message, blocking::SlackBot};
+
+let bot = SlackBot::new("xoxb-...", "C0123456789")?;
+bot.send(&Message::plain("service started"))?;
 # Ok(())
 # }
 ```
 
-Both clients support `with_client`, `with_timeout`, `send`, `send_to`, and
-`send_with_options`. The default timeout is six seconds. Blocking calls belong
-outside async executor threads. `with_base_url` supports test servers or trusted
-proxies: the supplied endpoint receives your token. Injected async clients must
-disable redirects and retries; default clients do so. Blocking requests disable
-redirects per request.
+`new` checks the token and channel, so a broken config fails at startup instead of on the first
+alert. Each client sends to its default channel with `send`, elsewhere with `send_to`, and into a
+thread with `reply`. `call` reaches any other Web API method, e.g. `chat.update` or
+`apps.connections.open`.
 
-## Literal text and explicit formatting
+## Messages
 
-`SlackMessage::plain(text)` is the primary API. It preserves literal punctuation,
-backticks, and underscores, and automatically truncates text above 40,000 escaped
-characters. At send time, only `&`, `<`, and `>` are entity-encoded for Slack, and
-`mrkdwn` is disabled. Literal `<@U123>` is displayed as text rather than a user
-mention. `text()` returns the possibly truncated source, not the escaped payload.
+`MessageBuilder` is the usual way to write a message:
 
-`MessageBuilder::new().line(...).kv(...).build()` assembles plain-text fields.
-Each line, key/value value, and label has a fixed 4,000-character escaped budget.
-These limits are fixed. The joined message is then capped at 40,000.
+| Method | Renders as |
+| --- | --- |
+| `new(title)` | bold first line |
+| `context(text)` | italic line, e.g. network and geo |
+| `kv(key, value)` | **key:** value |
+| `line(text)` | plain line |
+| `code(label, text)` | **label:** then a preformatted block, for errors and multi-line output |
+| `link(label, url)` | a link |
+| `footer(text)` | last line, never cut |
 
-For caller-authored Slack formatting, use `SlackMessage::mrkdwn`:
+It renders to a single `rich_text` block, so formatting comes from structure and values never
+need escaping. The same content goes along as plain `text`, which Slack uses for notifications.
+If Slack rejects the block (`invalid_blocks`, `msg_blocks_too_long`), the client sends that text
+on its own instead of failing.
 
-```rust
-use slack::SlackMessage;
-let message = SlackMessage::mrkdwn("*service recovered*\n<https://example.com|Dashboard>");
-assert!(message.is_mrkdwn());
-```
+`Message::plain(text)` sends literal text with no formatting. `Message::with_blocks` attaches
+your own Block Kit blocks, such as buttons, with the text as fallback.
 
-Formatted messages are sent unchanged. Explicit links and mentions are active.
-Do not pass arbitrary logs/user text as mrkdwn. `escape_text` can neutralize `&`,
-`<`, and `>` in a literal fragment, but does not escape emphasis or code delimiters.
-Use plain text when exact arbitrary content matters. No Unicode lookalikes are
-substituted and no formatting-repair fallback is attempted.
+### Size limits
 
-Both modes disable automatic mention parsing, automatic URL linking, and link/media
-previews. These flags do not neutralize explicit mention/link syntax in mrkdwn.
+The builder caps each value at 3,000 characters and the whole message at about 12,000, which
+stays under the point where Slack has been seen to reject rich text. When fields don't fit, the
+one that overflows gets cut, later ones are dropped with a "… n more fields omitted" line, and the
+footer survives. Put the instruction the reader must see in the footer.
 
-## Automatic size protection
+Plain messages are capped at 40,000 characters after escaping, Slack's own limit. Anything cut
+ends in `… [truncated]`. `slack::truncate` does the same for your own strings.
 
-Slack recommends 4,000 characters for readability and truncates top-level text
-above 40,000. This crate uses 40,000 as a safety ceiling; callers remain
-responsible for readable messages. There is no automatic splitting.
+## Retries
 
-Plain messages are shortened at construction. The builder caps each line, value,
-and label at 4,000, joins the fields, then truncates the combined message to a
-40,000-character prefix. Labels, separators, newlines, and markers count toward
-the aggregate limit. A single huge error usually leaves room for later context,
-but many large fields can cause trailing instructions to be cut. Put critical
-context early when composing potentially large messages.
-
-Truncation retains a source prefix and appends `… [truncated]`, included within
-the budget. Counts use Unicode scalar values after Slack escaping (`&` costs five characters), excluding JSON string encoding.
-Prefixes end on complete source characters, never partial entities. This is a
-conservative submitted-text budget, not a claim about Slack's internal counting.
-UTF-8 is preserved, but a grapheme cluster can be split.
+Retries are off by default. Turn them on per client:
 
 ```rust
-use slack::MessageBuilder;
-let error = "unexpected object: ".repeat(100_000);
-let message = MessageBuilder::new()
-    .line("Settlement failed")
-    .kv("report_id", 42)
-    .kv("error", error)
-    .line("Check the stored payment status before retrying.")
-    .build();
-assert!(message.text().contains("… [truncated]"));
-assert!(message.text().ends_with("Check the stored payment status before retrying."));
+use std::time::Duration;
+use slack::Retry;
+
+// Alerts: a duplicate beats a missing alert.
+let alerts = Retry::at_least_once(Retry::ALERT_DELAYS); // 5s, 10s, 20s
+
+// Things that must not double post: only retries when Slack can't have acted.
+let notices = Retry::when_undelivered([Duration::from_secs(1), Duration::from_secs(5)]);
 ```
 
-Pass original values directly; callers do not need escape-width calculations or
-Slack-specific error helpers. Use `SlackMessage::plain` for already composed text
-or intentional fields longer than 4,000 characters; its truncation preserves a
-prefix and cannot distinguish fields or instructions.
+Only transient failures are retried: connection problems, timeouts, 429, 5xx, malformed responses
+and Slack's own `ratelimited`, `internal_error` and the like. A wait is the configured delay or
+Slack's `Retry-After`, whichever is longer. Each retry logs a warning with the error. With the
+default six second timeout, `ALERT_DELAYS` gives up after about a minute.
 
-Both transports retain final validation and reject `mrkdwn` above 40,000 with
-`Error::MessageTooLong { chars, limit }`. Raw formatted text is never automatically
-cut or repaired. Empty messages are rejected. Block Kit is not implemented.
+`at_least_once` can post a message twice: if a request times out after Slack received it, Slack
+may have posted it and the retry posts it again. `when_undelivered` never resends in that case.
 
-`truncate_text` remains an optional helper counting *unescaped source* scalar
-values, with `…` included in its budget and an empty result for zero:
+The blocking client sleeps on the calling thread. If a slow alert must not hold up other work,
+send from a thread of its own.
 
-```rust
-use slack::{SlackMessage, truncate_text};
-let message = SlackMessage::plain(truncate_text("a long diagnostic", 10));
-assert_eq!(message.text(), "a long di…");
+## Errors
+
+`slack::Error` keeps everything it knows, and its `Display` is meant to go straight into a log or
+a message to the team:
+
+```text
+slack transport failed during connect: error sending request for url (https://slack.com/api/chat.postMessage): client error (Connect): tcp connect error: Connection refused (os error 61)
+slack api error not_in_channel: {"ok":false,"error":"not_in_channel"}
+slack http status 503: upstream connect error or disconnect/reset before headers
 ```
 
-It is not safe for truncating formatted mrkdwn. Automatic plain-message protection
-also accounts for escape expansion, which this source-text helper does not.
+| Variant | When |
+| --- | --- |
+| `Invalid` | rejected before sending, e.g. an empty message |
+| `Transport { stage, source }` | no complete response; `stage` says whether the request got out |
+| `Http { status, retry_after, body }` | non-2xx response |
+| `Api { code, body }` | Slack answered `ok: false` |
+| `Malformed { body, source }` | a 2xx response that doesn't parse or lacks `channel` and `ts` |
 
-## Migrating from 0.2.0
+`Stage::Connect` means resolving, connecting or the TLS handshake failed, so nothing reached Slack.
+Connecting gets three seconds of the request timeout, so a DNS or network problem shows up as such.
+`Stage::Exchange` means the request may have arrived.
 
-- Plain construction now truncates automatically; `text()` exposes that result.
-- Builder lines, values, and labels have a fixed 4,000-character escaped cap.
-  Use `SlackMessage::plain` for longer content; the aggregate cap still applies.
-- Remove caller-side Slack escaping and error-budget helpers; pass original data.
-- Raw `mrkdwn` retains its existing rejection behavior.
-- Slack's `message_truncated` warning is logged without changing successful sends
-  into errors. The warning contains no remote response text or message content.
-- Review long alerts when upgrading consumers such as Phoenix; pinned v0.2.0
-  dependencies do not change automatically.
-
-## Migrating from 0.1.0
-
-- Replace `MessageBuilder::new(ParseMode::Plain)` with `MessageBuilder::new()`.
-- Replace formatted builders with explicit `SlackMessage::mrkdwn` for authored
-  formatting, or plain messages for arbitrary data.
-- Replace `heading`/`bold_line` with `line`, and `kv_code`/`error` with `kv` when
-  plain output is appropriate. `ParseMode`, `ValueBudget`, and budget methods are removed.
-- Use plain builders for automatic size protection, or explicit `mrkdwn` for authored formatting.
-- `text()` exposes possibly truncated source text; transport escaping occurs once on send.
-
-## Delivery and errors
-
-Each send makes one application-level HTTP request. There are no retry loops,
-queues, automatic format fallbacks, or delivery guarantees. Callers own retry,
-backpressure, persistence, and cross-process channel pacing.
-
-A success requires HTTP success, JSON `ok: true`, and nonempty `channel` and `ts`.
-The returned timestamp stays a string. Errors distinguish validation, transport,
-HTTP status, Slack API rejection, malformed response, and HTTP 429 rate limiting.
-`RateLimited` preserves numeric `Retry-After` seconds when present. Unknown remote
-API error strings become `unknown_error`; bodies and underlying HTTP errors are
-not retained. Known safe Slack error codes remain available for diagnosis.
-
-Timeouts, lost responses, server errors, and malformed success responses may
-leave delivery uncertain. Retrying can duplicate a message. A 429 response
-should be rescheduled by the caller according to `Retry-After`; the crate never
-sleeps. There is no cross-client or distributed rate limiter.
-
-The crate's `tracing` events contain success/failure, error category, and a fixed
-warning when Slack reports truncation; they never include remote warning text.
-Client/message/result `Debug` output omits credentials and content. Callers should
-also avoid enabling verbose HTTP-library diagnostics or logging their config,
-request/response bodies, `text()`, or returned channel IDs.
+Instead of matching variants, ask the error: `is_transient()`, `delivery_uncertain()`,
+`retry_after()` and `api_code()`. These drive `Retry` too. Bodies are capped at 500 characters,
+and the token is masked if a response ever echoes it.
 
 ## Slack setup
 
-See [setup](docs/setup.md) and the [example app manifest](docs/slack-app-manifest.json).
-`CLIENT_SECRET` and `SIGNING_SECRET` match Slack’s app credential labels; they
-are separate from the `SLACK_BOT_TOKEN` required for posting. See the setup guide
-for credential mapping.
+The bot needs `chat:write` and an invite to each channel it posts in. Use channel IDs, not names.
+See [setup](docs/setup.md) and the [app manifest](docs/slack-app-manifest.json).
 
-Use a separate **Ultra Sound Ops** app with only `chat:write`, invited to intended
-channels. Installation, token provisioning, production changes, and service
-migration are outside this crate's release.
+## Development
 
-A bot token supports multiple joined channels and returns message identifiers.
-Incoming webhooks instead give each channel its own posting credential, reducing
-credential reach but requiring a secret per destination. Both are Slack apps,
-both support rich messages, and both need an interaction receiver for buttons.
-Sauron's existing adjustment webhook can remain separate.
+`./check.sh` runs fmt, clippy, tests and doctests for every feature combination, like CI. Tests run
+against a local mock server and need no token.
 
-## Migrating from Telegram
+The examples post for real, so point them at a test channel:
 
-Rebuild messages from original domain values with this builder. Telegram
-MarkdownV2 escaping and Telegram chat IDs are not Slack-compatible. Map channel
-IDs in service configuration, not in this library. Initially keep Telegram's
-interactive promotion controls in place; noninteractive dual delivery and
-fallback policy belong to the caller. See [future builder controls](docs/builder-controls.md).
+```bash
+SLACK_BOT_TOKEN=xoxb-... SLACK_CHANNEL_ID=C... cargo run --example async
+```
 
-## Validation and examples
-
-Run `./check.sh` for formatting, checks, Clippy, tests, and doctests across all
-four feature combinations. Tests use local mocked endpoints; no Slack token is
-needed. README examples are included as crate doctests.
-
-The runnable examples **send real messages** when explicitly run with
-`SLACK_BOT_TOKEN` and `SLACK_CHANNEL_ID`. The async example sends a plain
-message and one thread reply; the blocking example sends one plain message.
-Use an authorized test channel only. They are compiled, never executed, in CI.
-
-References: [posting API](https://docs.slack.dev/reference/methods/chat.postMessage/),
-[formatting](https://docs.slack.dev/messaging/formatting-message-text/),
-[rate limits](https://docs.slack.dev/apis/web-api/rate-limits/),
-[webhooks](https://docs.slack.dev/messaging/sending-messages-using-incoming-webhooks/).
+Releases are git tags, see [RELEASING.md](RELEASING.md) and [CHANGELOG.md](CHANGELOG.md).

@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.0
+
+A redesign around three goals: errors that say what went wrong, retries in the crate instead of
+in every caller, and messages that are formatted, not just escaped.
+
+- Errors keep their cause: the HTTP library's error chain, the response status and body, and
+  Slack's own error code, verbatim. `Transport` records whether the request got out
+  (`Stage::Connect` or `Stage::Exchange`), helped by a three second connect timeout.
+- `Error::is_transient`, `delivery_uncertain`, `retry_after` and `api_code` replace caller-side
+  classification.
+- Opt-in retries: `with_retry(Retry::at_least_once(..))` or `Retry::when_undelivered(..)`, honoring
+  `Retry-After`. `Retry::ALERT_DELAYS` is 5s, 10s, 20s.
+- `MessageBuilder::new(title)` renders a rich text block with `context`, `kv`, `line`, `code`,
+  `link` and a `footer` that is never cut, plus plain fallback text. If Slack rejects the blocks
+  the text is sent alone.
+- `SlackBot::new` validates the token and channel and returns a `Result`. `reply` threads under a
+  `SentMessage`; `call` reaches any Web API method; `Message::with_blocks` attaches custom blocks.
+- Breaking: `SlackMessage` is now `Message`, `BlockingSlackBot` is `blocking::SlackBot`,
+  `truncate_text` is `truncate`. Removed `SlackMessage::mrkdwn`, `SendOptions`, `send_with_options`,
+  `with_client`, `VERSION`, `MessageTooLong` and `TransportFailure`. `Error` is no longer
+  `Clone`/`PartialEq`; match on it or use its methods. The crate no longer logs every failure,
+  only retries; callers log the final error.
+
 ## 0.3.0
 
 - Automatically bound plain messages to 40,000 escaped characters with visible truncation.

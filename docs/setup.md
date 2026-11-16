@@ -1,7 +1,7 @@
 # Ultra Sound Ops setup
 
-This guide describes future installation. Creating the Rust repository does not
-install an app or provision any Slack credentials.
+How the **Ultra Sound Ops** app is set up, for reinstalling it or adding a channel. The crate
+itself never installs anything or reads credentials from the environment.
 
 1. Create a Slack app from `slack-app-manifest.json` in the intended workspace.
    Keep it separate from Sauron's adjustment integration.
@@ -33,8 +33,8 @@ Use Slack's interface names for the app credentials in local configuration and
 
 | Configuration name | Slack interface field | Purpose |
 | --- | --- | --- |
-| `SLACK_BOT_TOKEN` | Bot User OAuth Token | Required for posting; passed to `SlackBot` or `BlockingSlackBot` |
-| `SLACK_APP_TOKEN` | App-Level Token | Future Socket Mode (`connections:write`); not used for posting |
+| `SLACK_BOT_TOKEN` | Bot User OAuth Token | Required for posting; passed to `SlackBot::new` |
+| `SLACK_APP_TOKEN` | App-Level Token | Socket Mode (`connections:write`), used by Phoenix's button handler; not used for posting |
 | `CLIENT_SECRET` | Client Secret | OAuth code exchange and refresh; not used by this posting crate |
 | `SIGNING_SECRET` | Signing Secret | Verify inbound HTTP signatures; not used by this posting crate |
 
@@ -47,7 +47,7 @@ The runnable examples read process environment variables, not `.env` files.
 Store the two app secrets as concealed `CLIENT_SECRET` and `SIGNING_SECRET`
 fields in 1Password. Existing `bot_token` and `app_token` fields retain their names;
 map `bot_token` to the process variable `SLACK_BOT_TOKEN` when running examples,
-and `app_token` to `SLACK_APP_TOKEN` for a future Socket Mode receiver.
+and `app_token` to `SLACK_APP_TOKEN` for Socket Mode.
 Only inject credentials needed by the process: posting needs no app secrets.
 
 References: [OAuth](https://docs.slack.dev/authentication/installing-with-oauth/),
